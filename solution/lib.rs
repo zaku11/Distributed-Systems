@@ -6,14 +6,11 @@ pub use crate::stable_storage_public::*;
 pub use crate::system_setup_public::*;
 pub use domain::*;
 
-// use log::{info, warn};
-
 pub mod broadcast_public {
     use crate::executors_public::ModuleRef;
     use crate::{PlainSenderMessage, StableStorage, StubbornBroadcastModule, SystemAcknowledgmentMessage, SystemBroadcastMessage, SystemMessageContent, SystemMessageHeader, SystemMessage};
     use std::collections::{HashSet, HashMap};
     use uuid::Uuid;
-    use std::str::*;
 
     pub trait PlainSender: Send + Sync {
         fn send_to(&self, uuid: &Uuid, msg: PlainSenderMessage);
@@ -38,6 +35,12 @@ pub mod broadcast_public {
         vec.extend(header.message_source_id.as_bytes());
         vec.extend(header.message_id.as_bytes());
         vec
+    }
+    fn hdr_to_string(header : SystemMessageHeader) -> String {
+        let mut ans = String::new();
+        ans += &(header.message_source_id.to_string());
+        ans += &(header.message_id.to_string());
+        ans
     }
     fn deserialize_hdr(bytes : Vec<u8>) -> SystemMessageHeader {
         let mut fst = [0; TRANSFORM_BYTES_SIZE];
@@ -64,7 +67,8 @@ pub mod broadcast_public {
         for i in 0..TRANSFORM_BYTES_SIZE {
             fst[i] = bytes[i];
         }
-        (Uuid::from_bytes(fst), deserialize_hdr(bytes.drain(1..(TRANSFORM_BYTES_SIZE - 1)).collect()))
+        let other_part = bytes.split_off(TRANSFORM_BYTES_SIZE);
+        (Uuid::from_bytes(fst), deserialize_hdr(other_part))
     }
     fn serialize_msg(msg : SystemMessage) -> Vec<u8> {
         let mut vec = Vec::new();
@@ -74,8 +78,9 @@ pub mod broadcast_public {
     }
     fn deserialize_msg(mut bytes : Vec<u8>) -> SystemMessage {
         let hdr = deserialize_hdr(bytes.clone());
+        let other_part = bytes.split_off(2 * TRANSFORM_BYTES_SIZE); 
         let content = SystemMessageContent{
-            msg : bytes.drain(1..(2*TRANSFORM_BYTES_SIZE - 1)).collect(),
+            msg : other_part,
         };
         SystemMessage {
             header : hdr,
@@ -96,92 +101,111 @@ pub mod broadcast_public {
         actual_msges : HashMap<SystemMessageHeader, SystemMessage>,
     }
 
+    const MAX_FILE_CONTENT : usize = 65536;
+
+
     impl MyReliableBroadcast {
 
-        fn retrieve_pending(&mut self) {
-            match self.storage.get("keys_pending") {
-                Some(mut pending_bytes) => {
-                    let mut new_pending : HashSet<(Uuid, SystemMessageHeader)> = HashSet::new();
-                    while pending_bytes.clone().len() > 0 {
-                        if pending_bytes.len() < 3 * TRANSFORM_BYTES_SIZE {
-                            log::warn!("Invalid number of bytes when trying to retrieve pending")
-                        }
-                        else {
-                            let (uuid, hdr) = deserialize_hdr_with_uuid(pending_bytes.clone());
-                            pending_bytes.drain(1..(2 * TRANSFORM_BYTES_SIZE - 1)); 
-                            new_pending.insert((uuid, hdr));
-                        }
-                    }
-                    self.pending = new_pending 
-                }
-                None => {}
+        fn store_schema(&mut self, mut data : Vec<u8>, name : String) {
+            let mut iter = 0;
+            while data.len() > MAX_FILE_CONTENT {
+                let last_part = data.split_off(MAX_FILE_CONTENT);
+                let new_name = name.clone() + &iter.to_string();
+                self.storage.put(&new_name, &data).unwrap();
+                iter += 1;
+                data = last_part;
             }
+            let new_name = name + &iter.to_string();
+            self.storage.put(&new_name, &data).unwrap();
+        }
+        fn retrieve_schema(&mut self, name : String) -> Vec<u8> {
+            let mut iter = 0;
+            let mut content = Vec::new();
+            loop {
+                let new_name = name.clone() + &iter.to_string();
+                match self.storage.get(&new_name) {
+                    Some(some_bytes) => {
+                        content.extend(some_bytes);
+                    },
+                    None => {
+                        break;
+                    },
+                }
+                iter += 1;
+            }
+            content
+        }
+
+        fn retrieve_pending(&mut self) {
+            let mut pending_bytes = self.retrieve_schema("keys_pending".to_string());
+            let mut new_pending : HashSet<(Uuid, SystemMessageHeader)> = HashSet::new();
+            while !pending_bytes.clone().is_empty() {
+                if pending_bytes.len() < 3 * TRANSFORM_BYTES_SIZE {
+                    log::warn!("Invalid number of bytes when trying to retrieve pending")
+                }
+                else {
+                    let (uuid, hdr) = deserialize_hdr_with_uuid(pending_bytes.clone());
+                    pending_bytes = pending_bytes.split_off(3 * TRANSFORM_BYTES_SIZE); 
+                    new_pending.insert((uuid, hdr));
+                }
+            }
+            self.pending = new_pending 
         }
         fn store_pending(&mut self) {
             let mut keys_pending = Vec::new();
             for (uuid, hdr) in self.pending.clone() {
                 keys_pending.extend(serialize_hdr_with_uuid(uuid, hdr));
             }
-            self.storage.put("keys_pending", &keys_pending).unwrap();
+            self.store_schema(keys_pending, "keys_pending".to_string());
         }
         fn retrieve_delivered(&mut self) {
-            match self.storage.get("keys_delivered") {
-                Some(mut delivered_bytes) => {
-                    let mut new_delivered : HashSet<(Uuid, SystemMessageHeader)> = HashSet::new();
-                    while delivered_bytes.clone().len() > 0 {
-                        if delivered_bytes.len() < 3 * TRANSFORM_BYTES_SIZE {
-                            log::warn!("Invalid number of bytes when trying to retrieve delivered")
-                        }
-                        else {
-                            let (uuid, hdr) = deserialize_hdr_with_uuid(delivered_bytes.clone());
-                            delivered_bytes.drain(1..(2 * TRANSFORM_BYTES_SIZE - 1)); 
-                            new_delivered.insert((uuid, hdr));
-                        }
-                    }
-                    self.delivered = new_delivered
+            let mut delivered_bytes = self.retrieve_schema("keys_delivered".to_string());
+            let mut new_delivered : HashSet<(Uuid, SystemMessageHeader)> = HashSet::new();
+
+            while !delivered_bytes.clone().is_empty() {
+                if delivered_bytes.len() < 3 * TRANSFORM_BYTES_SIZE {
+                    log::warn!("Invalid number of bytes when trying to retrieve delivered")
                 }
-                None => {}
+                else {
+                    let (uuid, hdr) = deserialize_hdr_with_uuid(delivered_bytes.clone());
+                    delivered_bytes = delivered_bytes.split_off(3 * TRANSFORM_BYTES_SIZE); 
+                    new_delivered.insert((uuid, hdr));
+                }
             }
+            self.delivered = new_delivered
         }
         fn store_delivered(&mut self) {
             let mut keys_delivered = Vec::new();
             for (id, hdr) in self.delivered.clone() {
                 keys_delivered.extend(serialize_hdr_with_uuid(id, hdr));
             }
-            self.storage.put("keys_delivered", &keys_delivered).unwrap();
+            self.store_schema(keys_delivered, "keys_delivered".to_string());
         }
         fn retrieve_actual_msges(&mut self) {
-            match self.storage.get("keys_actual_msges") {
-                Some(mut actual_msges_bytes) => {
-                    let mut new_actual_msges : HashMap<SystemMessageHeader, SystemMessage> = HashMap::new();
+            let mut actual_msges_bytes = self.retrieve_schema("keys_actual_msges".to_string());
+            let mut new_actual_msges : HashMap<SystemMessageHeader, SystemMessage> = HashMap::new();
 
-                    while actual_msges_bytes.clone().len() > 0 {
-                        if actual_msges_bytes.len() < 2 * TRANSFORM_BYTES_SIZE {
-                            log::warn!("Invalid number of bytes when trying to retrieve actual msges")
-                        }
-                        else {
-                            let hdr = deserialize_hdr(actual_msges_bytes.clone());
-                            actual_msges_bytes.drain(1..(2 * TRANSFORM_BYTES_SIZE - 1)); 
-                            new_actual_msges.insert(
-                                hdr, 
-                                deserialize_msg(self.storage.get(
-                                    from_utf8(&serialize_hdr(hdr)).unwrap()
-                                ).unwrap())
-                            );
-                        }
-                    }
-                    self.actual_msges = new_actual_msges
+            while !actual_msges_bytes.clone().is_empty() {
+                if actual_msges_bytes.len() < 2 * TRANSFORM_BYTES_SIZE {
+                    log::warn!("Invalid number of bytes when trying to retrieve actual msges")
                 }
-                None => {}
+                else {
+                    let hdr = deserialize_hdr(actual_msges_bytes.clone());
+                    actual_msges_bytes = actual_msges_bytes.split_off(2 * TRANSFORM_BYTES_SIZE);
+                    new_actual_msges.insert(
+                        hdr, deserialize_msg(self.storage.get(&hdr_to_string(hdr)).unwrap())
+                    );
+                }
             }
+            self.actual_msges = new_actual_msges
         }
         fn store_actual_msges(&mut self) {
             let mut keys_msges = Vec::new();
             for (hdr, msg) in self.actual_msges.clone() {
                 keys_msges.extend(serialize_hdr(hdr));
-                self.storage.put(from_utf8(&serialize_hdr(hdr)).unwrap(), &serialize_msg(msg)).unwrap();
+                self.storage.put(&hdr_to_string(hdr), &serialize_msg(msg)).unwrap();
             }
-            self.storage.put("keys_actual_msges", &keys_msges).unwrap();
+            self.store_schema(keys_msges, "keys_actual_msges".to_string());
         }
         fn retrieve_current_msg_number(&mut self) {
             match self.storage.get("current_msg_number") {
@@ -212,27 +236,27 @@ pub mod broadcast_public {
                     message_id : Uuid::from_u128(self.current_msg_number),
                 },
                 data : SystemMessageContent {
-                    msg : msg.msg.clone(), // Will this work with instances on different machines?
+                    msg : msg.msg, // Will this work with instances on different machines?
                 },
             };
             self.pending.insert((self.id, system_msg.header));
             self.store_pending();
-            self.store_actual_msges();
 
             self.stubborn.send(SystemBroadcastMessage {
                 forwarder_id : self.id,
                 message : system_msg.clone(),
             });
             self.actual_msges.insert(system_msg.header, system_msg);
+            self.store_actual_msges();
+
             self.current_msg_number += 1;
             self.store_current_msg_number();
-            // self.try_to_deliver();
         }
 
         fn deliver_message(&mut self, msg: SystemBroadcastMessage) {
-            let source_id = msg.clone().message.header.message_source_id;
+            let source_id = msg.message.header.message_source_id;
             let forwarder_id = msg.forwarder_id;
-            let entry = (source_id, msg.clone().message.header);
+            let entry = (source_id, msg.message.header);
 
             if !self.pending.contains(&entry) {
                 self.pending.insert(entry);
@@ -240,7 +264,11 @@ pub mod broadcast_public {
                     forwarder_id : self.id,
                     message : msg.message.clone(),
                 }); // Unleash the storm!
+                self.actual_msges.insert(msg.message.header.clone(), msg.message.clone());
 
+                if !self.ack.contains_key(&msg.message.header) {
+                    self.ack.insert(msg.message.header, HashSet::new());
+                }
                 let ack_set = self.ack.get_mut(&msg.message.header).unwrap(); 
                 if !ack_set.contains(&forwarder_id) {
                     ack_set.insert(forwarder_id);
@@ -248,8 +276,8 @@ pub mod broadcast_public {
                     let hdr = msg.message.header;
                     let new_delivered_entry = (source_id, hdr);
                     if !self.delivered.contains(&new_delivered_entry) && ack_set.len() > self.how_many_proc / 2 {
-                        let full_msg = self.actual_msges.get(&hdr).unwrap();
-                        (*self.callback)(full_msg.clone());
+                        let full_msg = msg.message;
+                        (*self.callback)(full_msg);
                         self.delivered.insert(new_delivered_entry);
                         self.actual_msges.remove(&hdr);
                         self.store_delivered();
@@ -272,7 +300,7 @@ pub mod broadcast_public {
     ) -> Box<dyn ReliableBroadcast> {
 
         let mut new_broadcast = Box::new(MyReliableBroadcast {
-            stubborn : sbeb,
+            stubborn : sbeb.clone(),
             storage : storage,
             id : id,
             how_many_proc : processes_number,
@@ -287,6 +315,13 @@ pub mod broadcast_public {
         new_broadcast.retrieve_pending();
         new_broadcast.retrieve_actual_msges();
         new_broadcast.retrieve_current_msg_number();
+        for (_, val) in &new_broadcast.pending {
+            sbeb.send(SystemBroadcastMessage {
+                forwarder_id : id,
+                message : new_broadcast.actual_msges.get(val).unwrap().clone(),
+            });
+
+        }
 
         new_broadcast
     }
@@ -310,7 +345,7 @@ pub mod broadcast_public {
 
     impl StubbornBroadcast for MyStubbornBroadcast {
         fn broadcast(&mut self, msg: SystemBroadcastMessage) {
-            self.messages.insert(msg.clone().message.header.message_id, msg.clone());
+            self.messages.insert(msg.message.header.message_id, msg.clone());
             for other in &self.all_others {
                 self.still_left.insert((msg.clone().message.header.message_id, *other));
                 self.link.send_to(other, PlainSenderMessage::Broadcast(msg.clone()));
@@ -347,6 +382,9 @@ pub mod stable_storage_public {
     use std::fs::*;
     use std::io::Write;
     use std::str;
+    use std::fs::File;
+    use std::io::Read;
+
     const MAX_FILE_NAME : usize = 255;
     const MAX_FILE_CONTENT : usize = 65536;
     
@@ -358,46 +396,81 @@ pub mod stable_storage_public {
     struct MyStableStorage {
         dir : PathBuf,
     }
+    fn key_to_path(key : &str) -> PathBuf {
+        let v = key.split('/');
+        let mut ans = PathBuf::new();
+        for part in v {
+            ans.push(part);
+        }
+        ans
+    }
+    fn transform_key(key : &str) -> String {
+        let mut new_key = key.to_owned();
+        new_key = "!".to_owned() + &new_key + &"!".to_owned();
+        new_key.insert(new_key.len() / 2, '/');
+        new_key
+    }
+    
     impl StableStorage for MyStableStorage {
+
         fn put(&mut self, key: &str, value: &[u8]) -> Result<(), String> {
             if key.len() > MAX_FILE_NAME || value.len() > MAX_FILE_CONTENT {
                 return Err("Too long name or too long content.".to_string());
             } 
             let mut path_to_tmp = self.dir.clone();
+            let my_key = transform_key(key); 
+
             path_to_tmp.push("not_yet_inserted");
-            path_to_tmp.push(key);
+            path_to_tmp.push(key_to_path(&my_key));
+            create_dir_all(path_to_tmp.clone()).unwrap();
+
+            path_to_tmp.push("file");
             if path_to_tmp.is_file() {
                 std::fs::remove_file(path_to_tmp.clone()).unwrap();
             }
-            let mut file = std::fs::OpenOptions::new().create(true).write(true).open(path_to_tmp.clone()).unwrap();
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).open(path_to_tmp.clone()).unwrap();
 
             file.write_all(value).unwrap();
-            let mut path_to_normal = self.dir.clone();
-            path_to_normal.push(key);
-            Ok(rename(path_to_tmp.clone(), path_to_normal.clone()).unwrap())
 
+            let mut path_to_normal = self.dir.clone();
+            path_to_normal.push(key_to_path(&my_key));
+
+            create_dir_all(path_to_normal.clone()).unwrap();
+            
+            path_to_normal.push("file");
+
+            rename(path_to_tmp, path_to_normal).unwrap();
+
+            Ok(())
         }
         fn get(&self, key: &str) -> Option<Vec<u8>> {
             if key.len() > MAX_FILE_NAME {
                 return None;
             }
-            let content : String;
+            let my_key = transform_key(key);
+
             let mut file_path = self.dir.clone();
-            file_path.push(key);
+            file_path.push(key_to_path(&my_key));
+            file_path.push("file");
+
             if !file_path.is_file() {
                 return None;
             }
-            content = read_to_string(file_path).unwrap();
-            return Some(content.as_bytes().to_vec());
+            
+            let mut content = Vec::new();
+            let mut file = File::open(file_path).unwrap();
+            file.read_to_end(&mut content).unwrap();
+
+            Some(content)
         }
     }
 
-    pub fn build_stable_storage(_root_storage_dir: PathBuf) -> Box<dyn StableStorage> {
-        let mut tmp_path = _root_storage_dir.clone();
+    pub fn build_stable_storage(root_storage_dir: PathBuf) -> Box<dyn StableStorage> {
+        let mut tmp_path = root_storage_dir.clone();
         tmp_path.push("not_yet_inserted"); // This will be necessary so our put is atomic
-        create_dir_all(tmp_path.clone()).unwrap();
+        create_dir_all(tmp_path).unwrap();
         Box::new(MyStableStorage {
-            dir : _root_storage_dir,
+            dir : root_storage_dir,
         })
     }
 
@@ -415,8 +488,9 @@ pub mod executors_public {
     use core::cmp::Ordering;
     use std::thread::JoinHandle;
     use crossbeam_channel::{unbounded, Receiver, Sender};
-    use uuid::Uuid;
     use std::collections::HashMap;
+    use std::sync::Weak;
+
 
 
 
@@ -437,7 +511,7 @@ pub mod executors_public {
     struct TickEntry {
         start_time : SystemTime,
         dur : Duration, 
-        action_number : i32,
+        action_number : usize,
     }
 
     impl Ord for TickEntry{
@@ -458,139 +532,130 @@ pub mod executors_public {
     }
     impl Eq for TickEntry {}
     
-    // struct LittleMsg {
-    //     msg : Box<dyn Message>,
-    // }
-    
-    // pub type ClosureMsg<T> = Box<Fn(ModuleRef<T>) -> () + Send>;
     pub type ClosureMsg = Box<dyn Fn() -> () + Send>;
-    // pub type ClosureMsgBoxless = Fn() -> () + Send;
-    // pub trait MyTrait: Send + 'static + Sized {}
-    
-    // struct LittleBox<T : Send + 'static + ?Sized> {
-    //     mod_ref : Box<ModuleRef<T>>,
-    // }
 
     pub enum WorkerMsg {
-        // NewRbebModule((Uuid, Box<Fn() -> ModuleRef<dyn Send + 'static>>)),
-        NewRbebModule((Uuid, Box<dyn Fn() -> () + Send>)),
+        NewModule((u128, Arc<Mutex<dyn Send + 'static>>)),
         ExecuteMsg(ClosureMsg),
+        RemModule(u128),
+        EndingMsg,
     }
     
     pub struct System {
-        // stubborns : Vec<Sender<ClosureMsg<ModuleRef<StubbornBroadcastModule>>>>,
-        // pub reliables_msges : Vec<Sender<ClosureMsg<ModuleRef<ReliableBroadcastModule>>>>,
-        // stuff : Box<ModuleRef<Send + 'static>>,
-        // pub reliables : Arc<Mutex<HashMap<Uuid, ModuleRef<dyn Send + 'static>>>>,
-        // pub reliables_reverted : HashMap<ModuleRef<ReliableBroadcastModule>, Uuid >,
-        pub msges_go_here : Sender<WorkerMsg>, // This will be create ONCE
-        pub msg_queue : Receiver<WorkerMsg>,
-        // pub channels_to_reliables : Sender<ClosureMsg<ReliableBroadcastModule>>, 
-        // processes : Vec<>,
-        // no_msg_control : Arc<(Mutex<BinaryHeap <TickEntry> >, Condvar)>,
+        msges_go_here : Sender<WorkerMsg>, // This will be create ONCE
+
         executor_thread : Option<JoinHandle<()>>,
         tick_thread : Option<JoinHandle<()>>,
         last_number : u128,
 
-        last_action_number : i32,
-        tick_actions : Arc<Mutex<HashMap<i32, ClosureMsg>>>,
+        last_action_number : usize,
+        tick_actions : Arc<Mutex<Vec<ClosureMsg>>>,
         
         tick_request_data : Arc<(Mutex<BinaryHeap<TickEntry>>, Condvar)>,   
+        are_we_being_dropped : Arc<Mutex<bool>>,
     }
 
 
     impl System {
-        pub fn request_tick<T: Handler<Tick> + Send>(&mut self, requester: &ModuleRef<T>, _delay: Duration) {
+        pub fn request_tick<T: Handler<Tick> + Send>(&mut self, requester: &ModuleRef<T>, delay: Duration) {
+            
             let (tick_queue, sleeper) = &*self.tick_request_data;
             let req_clone = requester.clone();
 
             let mut tick_queue_locked = tick_queue.lock().unwrap(); 
-            let inserted_start_time = SystemTime::now();
 
-
-            self.tick_actions.lock().unwrap().insert(self.last_action_number, Box::new(
+            self.tick_actions.lock().unwrap().push(Box::new(
                 move || {
                     req_clone.force_send(Tick{});
                 }
             ));
-            println!("Created an action at nr.{}", self.last_action_number);
-            println!("With starttime = {:?}", inserted_start_time);
 
             tick_queue_locked.push(TickEntry{
-                start_time : inserted_start_time,
-                dur : _delay,
-                // module_ref : requester.clone(), 
-                // action : Box::new(move || req_clone.clone().send(Tick{}) ),
+                start_time : SystemTime::now() + delay,
+                dur : delay,
                 action_number : self.last_action_number
             });
+            
+            self.last_action_number += 1;
 
-            self.last_action_number = self.last_action_number + 1;
-
-            if tick_queue_locked.peek().unwrap().start_time == inserted_start_time {
+            if tick_queue_locked.peek().unwrap().action_number == self.last_action_number - 1 {
                 sleeper.notify_one();
             }
         }
 
         pub fn register_module<T : Send + 'static> (&mut self, module: T) -> ModuleRef<T> {
-            
+            let module_wrapped = Arc::new(Mutex::new(module));
+
             let module_ref = ModuleRef {
                 number : self.last_number,
-                module : Arc::new(Mutex::new(module)),
+                module : Arc::downgrade(&module_wrapped),
                 output_channel : self.msges_go_here.clone(),
+                how_many_instances : Arc::new(Mutex::new(1)),
             };
 
-            self.last_number = self.last_number + 1;
+            self.msges_go_here.send(WorkerMsg::NewModule((self.last_number, module_wrapped))).unwrap();
+            self.last_number += 1;
 
             module_ref
         }
 
         pub fn new() -> Self {
-            let (msges_go_here, msg_queue): (Sender<WorkerMsg>, Receiver<WorkerMsg>) = unbounded();
-            let (tx_ref, rx_ref) = (msges_go_here.clone(), msg_queue.clone());
+            let (msges_go_here, msg_queue) : (Sender<WorkerMsg>, Receiver<WorkerMsg>) = unbounded();
             let tick_request_data : Arc<(Mutex<BinaryHeap<TickEntry>>, Condvar)> = Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new()));   
 
-            let tick_actions : Arc<Mutex<HashMap<i32, ClosureMsg>>> = Arc::new(Mutex::new(HashMap::new()));
-
-            // self.stubborns.push(tx);
+            let tick_actions : Arc<Mutex<Vec<ClosureMsg>>> = Arc::new(Mutex::new(Vec::new()));
+            let are_we_being_dropped = Arc::new(Mutex::new(false));
 
             let executor_thread = std::thread::spawn(move || { 
+                let mut module_table : HashMap<u128, Arc<Mutex<dyn Send + 'static>>> = HashMap::new();
                 while let Ok(msg) = msg_queue.recv() {
                     match msg {
-                        WorkerMsg::NewRbebModule((id, module_ref)) => {
-                            println!("New module created!");
-                            // *Rc::get_mut(& mut reliables).unwrap().get_mut().unwrap().get_mut(&id).unwrap() = module_ref;
-
-                            // *(reliables.clone()).lock().unwrap().get_mut(&id).unwrap() = module_ref;
+                        WorkerMsg::NewModule((id, module_ref)) => {
+                            module_table.insert(id, module_ref);
                         },
                         WorkerMsg::ExecuteMsg(closure) => {
-                            println!("ExecuteMsg!");
                             closure();
+                        },
+                        WorkerMsg::RemModule(id) => {
+                            module_table.remove(&id);
+                        },
+                        WorkerMsg::EndingMsg => {
+                            break;
                         },
                     }
                 }
             });
             let req_clone = tick_request_data.clone();
             let action_table = tick_actions.clone();
+            let are_we_being_dropped_clone = are_we_being_dropped.clone();
+                    
             let tick_thread = std::thread::spawn(move || {
+                let (lock, sleeper) = &*req_clone;
+                let mut guard = lock.lock().unwrap();
                 loop { 
-                    {
-                        let (lock, sleeper) = &*req_clone.clone();
-                        let mut guard = lock.lock().unwrap();
-                        while guard.is_empty() {
-                            guard = sleeper.wait(guard).unwrap();
-                        }
-
-                        let start_time = guard.peek().unwrap().start_time;
-                        if start_time > SystemTime::now() {
-                            let timeout_time = start_time.duration_since(SystemTime::now()).unwrap();
-                            let _result = sleeper.wait_timeout(guard, timeout_time).unwrap();
-                        }
+                    while guard.is_empty() && !*are_we_being_dropped_clone.lock().unwrap() {
+                        guard = sleeper.wait(guard).unwrap();
                     }
+                    if *are_we_being_dropped_clone.lock().unwrap() {
+                        break;
+                    }
+                    let mut start_time = guard.peek().unwrap().start_time;
+
+                    while start_time > SystemTime::now() {
+                        let timeout_time = start_time.duration_since(SystemTime::now()).unwrap();
+                        guard = sleeper.wait_timeout(guard, timeout_time).unwrap().0;
+
+                        if *are_we_being_dropped_clone.lock().unwrap() {
+                            break;
+                        }
+
+                        start_time = guard.peek().unwrap().start_time;
+                    }
+                    if *are_we_being_dropped_clone.lock().unwrap() {
+                        break;
+                    }
+
                     //Either the timeout has elapsed or a new element came to the heap
-
-                    let (lock, _) = &*req_clone.clone();
-                    let mut guard = lock.lock().unwrap();
-
 
                     let TickEntry {
                         start_time,
@@ -598,28 +663,21 @@ pub mod executors_public {
                         action_number,
                     } = guard.pop().unwrap();
 
-                    println!("Got myself an action nr.{}", action_number);
-                    println!("And now is {:?}", SystemTime::now());
-                    println!("With start_time = {:?}", start_time);
-
                     let table_lock = action_table.lock().unwrap();
-                    let specific_action = table_lock.get(&action_number).unwrap();
-                    // let specific_action = val.lock().unwrap(); 
+                    let specific_action = &table_lock[action_number];
 
                     specific_action();
                     guard.push(TickEntry{
                         start_time : start_time + dur,
                         dur : dur,
                         action_number : action_number,
-                        // action : action,
                     });
                 }
  
             });
 
             System {
-                msges_go_here : tx_ref, // This will be create ONCE
-                msg_queue : rx_ref,
+                msges_go_here : msges_go_here, // This will be create ONCE
                 executor_thread : Some(executor_thread),
                 tick_thread : Some(tick_thread),
                 tick_request_data : tick_request_data,
@@ -628,21 +686,29 @@ pub mod executors_public {
                 tick_actions : tick_actions,
 
                 last_number : 0,
+                are_we_being_dropped : are_we_being_dropped,
             }
         }
-
-        #[allow(dead_code)]
+    }
+    impl Drop for System {
         fn drop(&mut self) {
-            println!("Drop!");
+            self.msges_go_here.send(WorkerMsg::EndingMsg).unwrap();
+            
             self.executor_thread.take().unwrap().join().unwrap();
+            {
+                *self.are_we_being_dropped.lock().unwrap().deref_mut() = true;
+                let (_, sleeper) = &*self.tick_request_data.clone();
+                sleeper.notify_one();
+            }
             self.tick_thread.take().unwrap().join().unwrap();
         }
     }
 
     pub struct ModuleRef<T: 'static + Send> {
-        module : Arc<Mutex<T>>,
+        module : Weak<Mutex<T>>,
         output_channel : Sender<WorkerMsg>,
         number : u128,
+        how_many_instances : Arc<Mutex<usize>>,
     }
 
     impl<T : Send> ModuleRef<T > {
@@ -650,7 +716,10 @@ pub mod executors_public {
         where
             T: Handler<M>,
         {
-            self.module.lock().unwrap().deref_mut().handle(msg);
+            match self.module.upgrade() {
+                Some(module) => module.lock().unwrap().deref_mut().handle(msg), 
+                _ => (),
+            }
         }
     }
 
@@ -661,11 +730,14 @@ pub mod executors_public {
             T: Handler<M>,
         {
             let mod_ref = self.module.clone();
-            self.output_channel.send(WorkerMsg::ExecuteMsg(
+            let _ = self.output_channel.send(WorkerMsg::ExecuteMsg( 
                 Box::new(move || {
-                    mod_ref.lock().unwrap().deref_mut().handle(msg.clone());
+                    match mod_ref.upgrade() {
+                        Some(module) => module.lock().unwrap().deref_mut().handle(msg.clone()), 
+                        _ => (),
+                    }
                 })
-            )).unwrap();
+            ));
         }
     }
 
@@ -677,10 +749,21 @@ pub mod executors_public {
 
     impl<T : Send> Clone for ModuleRef<T> {
         fn clone(&self) -> Self {
+            (*self.how_many_instances.lock().unwrap().deref_mut()) += 1;
             ModuleRef {
                 module : self.module.clone(),
                 output_channel : self.output_channel.clone(),
                 number : self.number,
+                how_many_instances : self.how_many_instances.clone(),
+            }
+        }
+    }
+
+    impl<T : Send> Drop for ModuleRef<T> {
+        fn drop(&mut self) {
+            (*self.how_many_instances.lock().unwrap().deref_mut()) -= 1;
+            if *self.how_many_instances.lock().unwrap() == 0 {
+                let _ = self.output_channel.send(WorkerMsg::RemModule(self.number));
             }
         }
     }
@@ -692,25 +775,22 @@ pub mod system_setup_public {
     use crate::build_reliable_broadcast;
 
     pub fn setup_system(
-        _system: &mut System,
-        _config: Configuration,
+        system: &mut System,
+        config: Configuration,
     ) -> ModuleRef<ReliableBroadcastModule> {
-        let stub_broad = build_stubborn_broadcast(_config.sender, _config.processes.clone());
-        let stub_broad_ref = _system.register_module(StubbornBroadcastModule{
+        let stub_broad = build_stubborn_broadcast(config.sender, config.processes.clone());
+        let stub_broad_ref = system.register_module(StubbornBroadcastModule{
             stubborn_broadcast : stub_broad,
         });
-        _system.request_tick(&stub_broad_ref, _config.retransmission_delay);
+        system.request_tick(&stub_broad_ref, config.retransmission_delay);
 
-        let stab_stor = _config.stable_storage;
-        // let stab_stor_ref = _system.register_module(stab_stor);
+        let stab_stor = config.stable_storage;
 
-        let rel_broad = build_reliable_broadcast(stub_broad_ref.clone(), stab_stor, _config.self_process_identifier, _config.processes.clone().len(), _config.delivered_callback);
-        let rbeb_module_ref = _system.register_module(ReliableBroadcastModule {
+        let rel_broad = build_reliable_broadcast(stub_broad_ref, stab_stor, config.self_process_identifier, config.processes.clone().len(), config.delivered_callback);
+
+        system.register_module(ReliableBroadcastModule {
             reliable_broadcast : rel_broad,
-        });
-
-
-        rbeb_module_ref
+        })
     }
 
     pub struct ReliableBroadcastModule {
